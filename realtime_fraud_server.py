@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, Header, HTTPException
 import psycopg2, os, ipaddress, hmac, hashlib, base64, requests
 import geoip2.database
 from urllib.parse import urlparse, parse_qs
+from datetime import datetime
 
 # ───────── CONFIG ─────────
 SUPABASE_URL   = os.environ["SUPABASE_URL"]
@@ -15,10 +16,9 @@ ASN_DB  = "GeoLite2-ASN.mmdb"
 TELCOS    = ["jio","airtel","vodafone","idea","bsnl","tata"]
 PLATFORMS = ["meta","facebook","google","whatsapp","cloudflare","amazon","aws"]
 
-# ───────── Download GeoIP on boot ─────────
+# ───────── Download GeoIP ─────────
 def download(url, path):
     if not os.path.exists(path):
-        print("Downloading", path)
         r = requests.get(url, timeout=60)
         r.raise_for_status()
         with open(path,"wb") as f:
@@ -50,23 +50,15 @@ store_name,location_match,ip_checked,fraud_bucket,risk_score
 %(product_id)s,%(variant_id)s,%(product_name)s,%(variant_name)s,%(vendor)s,%(price)s,%(quantity)s,%(weight)s,
 %(utm_source)s,%(utm_medium)s,%(utm_campaign)s,%(utm_content)s,%(utm_term)s,%(utm_id)s,%(full_url)s,%(ip_address)s,
 %(store_name)s,%(location_match)s,%(ip_checked)s,%(fraud_bucket)s,%(risk_score)s
-) ON CONFLICT (row_id) DO NOTHING;
+);
 """
 
-# ───────── SHOPIFY HMAC (FIXED) ─────────
+# ───────── SHOPIFY HMAC ─────────
 def verify(data, hmac_header):
     if not hmac_header:
         return False
-
-    digest = hmac.new(
-        SHOPIFY_SECRET.encode(),
-        data,
-        hashlib.sha256
-    ).digest()
-
-    calculated = base64.b64encode(digest).decode("utf-8")
-
-    return hmac.compare_digest(calculated, hmac_header)
+    digest = hmac.new(SHOPIFY_SECRET.encode(), data, hashlib.sha256).digest()
+    return hmac.compare_digest(base64.b64encode(digest).decode(), hmac_header)
 
 # ───────── HELPERS ─────────
 def clean(x): return str(x).strip() if x else None
@@ -99,17 +91,46 @@ def geo(ip):
     except:
         return None
 
-# ───────── FRAUD ─────────
-def classify(country,state,utm,ipg):
-    if any(t in ipg["org"] for t in TELCOS):
-        return ("TELECOM",5)
-    if any(p in ipg["org"] for p in PLATFORMS) or utm in ["facebook","google","instagram","whatsapp"]:
-        return ("PLATFORM",10)
-    if country and ipg["country"] and country.lower()!=ipg["country"].lower():
-        return ("REAL_FRAUD",95)
-    if state and ipg["state"] and state.lower()!=ipg["state"].lower():
-        return ("REAL_FRAUD",80)
-    return ("CLEAN",0)
+# ───────── FRAUD BRAIN ─────────
+def seen_before(field, value):
+    if not value:
+        return False
+    cur.execute(f"SELECT 1 FROM shopify_orders_marketing WHERE {field}=%s LIMIT 1", (value,))
+    return cur.fetchone() is not None
+
+def burst():
+    cur.execute("SELECT COUNT(*) FROM shopify_orders_marketing WHERE date_time > NOW() - interval '2 minutes'")
+    return cur.fetchone()[0] > 12
+
+def address_entropy(addr):
+    if not addr:
+        return 0
+    words = addr.lower().split()
+    return len(set(words)) / max(len(words),1)
+
+def classify(note, utm, ipg):
+    risk = 0
+    org = ipg.get("org","") if ipg else ""
+
+    if any(t in org for t in TELCOS): risk += 10
+    if any(p in org for p in PLATFORMS): risk += 15
+    if utm in ["facebook","instagram"]: risk += 15
+
+    if seen_before("ip_address", note.get("ip_address")): risk += 25
+    if seen_before("phone", note.get("phone")): risk += 35
+
+    if burst(): risk += 30
+
+    addr = (note.get("address1") or "") + " " + (note.get("address2") or "")
+    if address_entropy(addr) < 0.5: risk += 20
+
+    if note.get("country") and ipg and note["country"].lower()!= (ipg["country"] or "").lower():
+        risk += 40
+
+    if risk >= 80: return "REAL_FRAUD", risk
+    if risk >= 60: return "TELECOM", risk
+    if risk >= 30: return "PLATFORM", risk
+    return "CLEAN", risk
 
 # ───────── FLATTENER ─────────
 def build_row(order, li, store):
@@ -123,7 +144,6 @@ def build_row(order, li, store):
         "date_time": order["created_at"],
         "order_id": order["id"],
         "order_name": order.get("name"),
-
         "customer_name": note.get("full_name"),
         "phone": digits(note.get("phone")),
         "address1": note.get("house_no._&_colony/apartment"),
@@ -132,7 +152,6 @@ def build_row(order, li, store):
         "state": note.get("state"),
         "zip": digits(note.get("zip_code")),
         "country": note.get("country"),
-
         "product_id": li.get("product_id"),
         "variant_id": li.get("variant_id"),
         "product_name": li.get("title"),
@@ -141,7 +160,6 @@ def build_row(order, li, store):
         "price": li.get("price"),
         "quantity": li.get("quantity"),
         "weight": li.get("grams"),
-
         "utm_source": note.get("utm_source") or utms.get("utm_source"),
         "utm_medium": note.get("utm_medium") or utms.get("utm_medium"),
         "utm_campaign": note.get("utm_campaign") or utms.get("utm_campaign"),
@@ -155,16 +173,12 @@ def build_row(order, li, store):
 
 # ───────── WEBHOOK ─────────
 @app.post("/shopify")
-async def shopify(
-    req: Request,
-    x_shopify_hmac_sha256: str = Header(None),
-    x_shopify_shop_domain: str = Header(None)
-):
+async def shopify(req: Request, x_shopify_hmac_sha256: str = Header(None), x_shopify_shop_domain: str = Header(None)):
     raw = await req.body()
     if not verify(raw, x_shopify_hmac_sha256):
         raise HTTPException(401,"Bad HMAC")
 
-    store = x_shopify_shop_domain or "unknown_store"
+    store = x_shopify_shop_domain or "unknown"
 
     order = await req.json()
     note = parse_notes(order.get("note_attributes",[]))
@@ -173,16 +187,11 @@ async def shopify(
     ip  = note.get("ip_address")
 
     ipg = geo(ip)
-    location_match = False
-    bucket,score = ("UNKNOWN",50)
-
-    if ipg:
-        location_match = (note.get("country") or "").lower() == (ipg["country"] or "").lower()
-        bucket,score = classify(note.get("country"),note.get("state"),utm,ipg)
+    bucket,score = classify(note, utm, ipg)
 
     for li in order["line_items"]:
         row = build_row(order, li, store)
-        row["location_match"] = location_match
+        row["location_match"] = False
         row["ip_checked"] = True if ipg else False
         row["fraud_bucket"] = bucket
         row["risk_score"] = score
