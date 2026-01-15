@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, Header, HTTPException
-import psycopg2, os, ipaddress, hmac, hashlib, requests
+import psycopg2, os, ipaddress, hmac, hashlib, base64, requests
 import geoip2.database
 from urllib.parse import urlparse, parse_qs
 
@@ -53,11 +53,22 @@ store_name,location_match,ip_checked,fraud_bucket,risk_score
 ) ON CONFLICT (row_id) DO NOTHING;
 """
 
-# ───────── HELPERS ─────────
+# ───────── HMAC VERIFY (FIXED) ─────────
 def verify(data, hmac_header):
-    digest = hmac.new(SHOPIFY_SECRET.encode(), data, hashlib.sha256).digest()
-    return hmac.compare_digest(digest, bytes.fromhex(hmac_header))
+    if not hmac_header:
+        return False
 
+    digest = hmac.new(
+        SHOPIFY_SECRET.encode(),
+        data,
+        hashlib.sha256
+    ).digest()
+
+    calculated = base64.b64encode(digest).decode("utf-8")
+
+    return hmac.compare_digest(calculated, hmac_header)
+
+# ───────── HELPERS ─────────
 def clean(x): return str(x).strip() if x else None
 def digits(x): return "".join(c for c in str(x) if c.isdigit()) if x else None
 
