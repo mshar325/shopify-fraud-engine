@@ -1,17 +1,31 @@
 from fastapi import FastAPI, Request, Header, HTTPException
-import psycopg2, os, ipaddress, hmac, hashlib
+import psycopg2, os, ipaddress, hmac, hashlib, requests
 import geoip2.database
 from urllib.parse import urlparse, parse_qs
 
 # ───────── CONFIG ─────────
-SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_URL   = os.environ["SUPABASE_URL"]
 SHOPIFY_SECRET = os.environ["SHOPIFY_SECRET"]
+CITY_URL = os.environ["GEOIP_CITY_URL"]
+ASN_URL  = os.environ["GEOIP_ASN_URL"]
 
 CITY_DB = "GeoLite2-City.mmdb"
 ASN_DB  = "GeoLite2-ASN.mmdb"
 
 TELCOS    = ["jio","airtel","vodafone","idea","bsnl","tata"]
 PLATFORMS = ["meta","facebook","google","whatsapp","cloudflare","amazon","aws"]
+
+# ───────── Download GeoIP on boot ─────────
+def download(url, path):
+    if not os.path.exists(path):
+        print("Downloading", path)
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        with open(path,"wb") as f:
+            f.write(r.content)
+
+download(CITY_URL, CITY_DB)
+download(ASN_URL,  ASN_DB)
 
 city_reader = geoip2.database.Reader(CITY_DB)
 asn_reader  = geoip2.database.Reader(ASN_DB)
