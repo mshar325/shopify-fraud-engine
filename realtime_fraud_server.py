@@ -53,7 +53,7 @@ store_name,location_match,ip_checked,fraud_bucket,risk_score
 ) ON CONFLICT (row_id) DO NOTHING;
 """
 
-# ───────── HMAC VERIFY (FIXED) ─────────
+# ───────── SHOPIFY HMAC (FIXED) ─────────
 def verify(data, hmac_header):
     if not hmac_header:
         return False
@@ -155,10 +155,16 @@ def build_row(order, li, store):
 
 # ───────── WEBHOOK ─────────
 @app.post("/shopify")
-async def shopify(req: Request, x_shopify_hmac_sha256: str = Header(None)):
+async def shopify(
+    req: Request,
+    x_shopify_hmac_sha256: str = Header(None),
+    x_shopify_shop_domain: str = Header(None)
+):
     raw = await req.body()
     if not verify(raw, x_shopify_hmac_sha256):
         raise HTTPException(401,"Bad HMAC")
+
+    store = x_shopify_shop_domain or "unknown_store"
 
     order = await req.json()
     note = parse_notes(order.get("note_attributes",[]))
@@ -175,7 +181,7 @@ async def shopify(req: Request, x_shopify_hmac_sha256: str = Header(None)):
         bucket,score = classify(note.get("country"),note.get("state"),utm,ipg)
 
     for li in order["line_items"]:
-        row = build_row(order,li,order["shop_id"])
+        row = build_row(order, li, store)
         row["location_match"] = location_match
         row["ip_checked"] = True if ipg else False
         row["fraud_bucket"] = bucket
