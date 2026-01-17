@@ -16,16 +16,16 @@ ASN_DB  = "GeoLite2-ASN.mmdb"
 TELCOS    = ["jio","airtel","vodafone","idea","bsnl","tata"]
 PLATFORMS = ["meta","facebook","google","whatsapp","cloudflare","amazon","aws"]
 
-# ───────── Download GeoIP ─────────
+# ───────── DOWNLOAD GEOIP ─────────
 def download(url, path):
     if not os.path.exists(path):
         r = requests.get(url, timeout=60)
         r.raise_for_status()
-        with open(path,"wb") as f:
+        with open(path, "wb") as f:
             f.write(r.content)
 
 download(CITY_URL, CITY_DB)
-download(ASN_URL,  ASN_DB)
+download(ASN_URL, ASN_DB)
 
 city_reader = geoip2.database.Reader(CITY_DB)
 asn_reader  = geoip2.database.Reader(ASN_DB)
@@ -37,6 +37,7 @@ db = psycopg2.connect(SUPABASE_URL, sslmode="require")
 db.autocommit = True
 cur = db.cursor()
 
+# ───────── IDEMPOTENT INSERT (IMPORTANT FIX) ─────────
 INSERT_SQL = """
 INSERT INTO shopify_orders_marketing (
 row_id,date,date_time,order_id,order_name,
@@ -50,31 +51,44 @@ store_name,location_match,ip_checked,fraud_bucket,risk_score
 %(product_id)s,%(variant_id)s,%(product_name)s,%(variant_name)s,%(vendor)s,%(price)s,%(quantity)s,%(weight)s,
 %(utm_source)s,%(utm_medium)s,%(utm_campaign)s,%(utm_content)s,%(utm_term)s,%(utm_id)s,%(full_url)s,%(ip_address)s,
 %(store_name)s,%(location_match)s,%(ip_checked)s,%(fraud_bucket)s,%(risk_score)s
-);
+)
+ON CONFLICT (row_id) DO NOTHING;
 """
 
 # ───────── SHOPIFY HMAC ─────────
 def verify(data, hmac_header):
     if not hmac_header:
         return False
-    digest = hmac.new(SHOPIFY_SECRET.encode(), data, hashlib.sha256).digest()
-    return hmac.compare_digest(base64.b64encode(digest).decode(), hmac_header)
+    digest = hmac.new(
+        SHOPIFY_SECRET.encode(),
+        data,
+        hashlib.sha256
+    ).digest()
+    return hmac.compare_digest(
+        base64.b64encode(digest).decode(),
+        hmac_header
+    )
 
 # ───────── HELPERS ─────────
-def clean(x): return str(x).strip() if x else None
-def digits(x): return "".join(c for c in str(x) if c.isdigit()) if x else None
+def clean(x):
+    return str(x).strip() if x else None
+
+def digits(x):
+    return "".join(c for c in str(x) if c.isdigit()) if x else None
 
 def extract_utms(url):
-    if not url: return {}
+    if not url:
+        return {}
     q = urlparse(url).query
-    return {k:v[0] for k,v in parse_qs(q).items() if k.startswith("utm_")}
+    return {k: v[0] for k, v in parse_qs(q).items() if k.startswith("utm_")}
 
 def parse_notes(attrs):
-    out={}
+    out = {}
     for a in attrs or []:
-        k=(a.get("name") or "").lower().replace(" ","_")
-        v=clean(a.get("value"))
-        if v: out[k]=v
+        k = (a.get("name") or "").lower().replace(" ", "_")
+        v = clean(a.get("value"))
+        if v:
+            out[k] = v
     return out
 
 # ───────── GEO ─────────
@@ -88,43 +102,48 @@ def geo(ip):
             "state": c.subdivisions.most_specific.name,
             "org": (a.autonomous_system_organization or "").lower()
         }
-    except:
+    except Exception:
         return None
 
 # ───────── FRAUD BRAIN ─────────
 def seen_before(field, value):
     if not value:
         return False
-    cur.execute(f"SELECT 1 FROM shopify_orders_marketing WHERE {field}=%s LIMIT 1", (value,))
+    cur.execute(
+        f"SELECT 1 FROM shopify_orders_marketing WHERE {field}=%s LIMIT 1",
+        (value,)
+    )
     return cur.fetchone() is not None
 
 def burst():
-    cur.execute("SELECT COUNT(*) FROM shopify_orders_marketing WHERE date_time > NOW() - interval '2 minutes'")
+    cur.execute("""
+        SELECT COUNT(*) FROM shopify_orders_marketing
+        WHERE date_time > NOW() - interval '2 minutes'
+    """)
     return cur.fetchone()[0] > 12
 
 def address_entropy(addr):
     if not addr:
         return 0
     words = addr.lower().split()
-    return len(set(words)) / max(len(words),1)
+    return len(set(words)) / max(len(words), 1)
 
 def classify(note, utm, ipg):
     risk = 0
-    org = ipg.get("org","") if ipg else ""
+    org = ipg.get("org", "") if ipg else ""
 
     if any(t in org for t in TELCOS): risk += 10
     if any(p in org for p in PLATFORMS): risk += 15
-    if utm in ["facebook","instagram"]: risk += 15
+    if utm in ["facebook", "instagram"]: risk += 15
 
     if seen_before("ip_address", note.get("ip_address")): risk += 25
     if seen_before("phone", note.get("phone")): risk += 35
-
     if burst(): risk += 30
 
     addr = (note.get("address1") or "") + " " + (note.get("address2") or "")
     if address_entropy(addr) < 0.5: risk += 20
 
-    if note.get("country") and ipg and note["country"].lower()!= (ipg["country"] or "").lower():
+    if note.get("country") and ipg and note["country"].lower() != (ipg["country"] or "").lower():
         risk += 40
 
     if risk >= 80: return "REAL_FRAUD", risk
@@ -134,7 +153,7 @@ def classify(note, utm, ipg):
 
 # ───────── FLATTENER ─────────
 def build_row(order, li, store):
-    note = parse_notes(order.get("note_attributes",[]))
+    note = parse_notes(order.get("note_attributes", []))
     landing = order.get("landing_site_ref") or order.get("landing_site")
     utms = extract_utms(landing)
 
@@ -173,21 +192,25 @@ def build_row(order, li, store):
 
 # ───────── WEBHOOK ─────────
 @app.post("/shopify")
-async def shopify(req: Request, x_shopify_hmac_sha256: str = Header(None), x_shopify_shop_domain: str = Header(None)):
+async def shopify(
+    req: Request,
+    x_shopify_hmac_sha256: str = Header(None),
+    x_shopify_shop_domain: str = Header(None)
+):
     raw = await req.body()
     if not verify(raw, x_shopify_hmac_sha256):
-        raise HTTPException(401,"Bad HMAC")
+        raise HTTPException(401, "Bad HMAC")
 
     store = x_shopify_shop_domain or "unknown"
-
     order = await req.json()
-    note = parse_notes(order.get("note_attributes",[]))
+
+    note = parse_notes(order.get("note_attributes", []))
     landing = order.get("landing_site_ref") or order.get("landing_site")
     utm = note.get("utm_source") or extract_utms(landing).get("utm_source")
     ip  = note.get("ip_address")
 
     ipg = geo(ip)
-    bucket,score = classify(note, utm, ipg)
+    bucket, score = classify(note, utm, ipg)
 
     for li in order["line_items"]:
         row = build_row(order, li, store)
@@ -195,6 +218,6 @@ async def shopify(req: Request, x_shopify_hmac_sha256: str = Header(None), x_sho
         row["ip_checked"] = True if ipg else False
         row["fraud_bucket"] = bucket
         row["risk_score"] = score
-        cur.execute(INSERT_SQL,row)
+        cur.execute(INSERT_SQL, row)
 
-    return {"status":"ok"}
+    return {"status": "ok"}
